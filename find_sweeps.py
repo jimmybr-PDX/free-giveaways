@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Near-zero-cost sweepstakes finder (Portland / Oregon City, OR area). Stdlib only.
+"""Near-zero-cost sweepstakes finder for Jimmy (Oregon City, OR). Stdlib only.
 Read-only: fetches public listings, never enters or submits anything.
 Usage: python3 find_sweeps.py [--verbose]
 """
@@ -9,6 +9,9 @@ from email.utils import parsedate_to_datetime
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CSV_PATH = os.path.join(HERE, "tracker.csv"); HTML_PATH = os.path.join(HERE, "tracker.html")
+CACHE_PATH = os.path.join(HERE, "detail_cache.json")
+DETAIL_CAP = 30
+AGG_RX = r"sweepstakesfanatics\.com|online-sweepstakes\.com|contestgirl\.com"
 STATUS_PATH = os.path.join(HERE, "last_run_status.json")
 UA = "Mozilla/5.0 (X11; Linux x86_64) SweepsFinder/1.0 (personal, low-volume)"
 COLS = ["prize","est_value","entry_link","end_date","frequency","entered_date","won","first_seen","source","tag"]
@@ -43,7 +46,7 @@ SOURCES = [
     ("Willamette Week", "https://www.wweek.com/arc/outboundfeeds/rss/?outputType=xml", "local"),
 ]
 LOCAL_RX = r"\bfree (food|admission|tickets?|event|day|museum|entry|stuff|meal|coffee|concert|movie|parking|rides?|classes?|flu shots?|covid|tree|trees|compost|mulch)|freebies?|giveaways?|give away|giving away|sweepstakes|chance to win|\bwin (a|free|tickets)|free things to do|for free\b|\bfree\b.*\b(portland|oregon city|clackamas|milwaukie|lake oswego|west linn|gladstone)"
-LOCAL_NOISE = r"live stream|how to watch|betting|best bets|odds|predictions|picks|winners|medals|free agen|free throw|free-for-all|scam"
+LOCAL_NOISE = r"live stream|how to watch|\bwatch\b.*\b(live|tonight|game)\b|betting|best bets|odds|predictions|picks|winners|medals|free agen|free throw|free-for-all|scam"
 
 _robots = {}
 def allowed(url):
@@ -195,6 +198,58 @@ def parse_page(src, url, body):
     if not re.search(r"sweepstakes|giveaway|enter to win|chance to win", txt, re.I): return []
     return [dict(title=title, link=url, text=txt, source=src)]
 
+def article_text(url, body):
+    """Return (text, official_url) for an aggregator detail page."""
+    nos = re.sub(r"<(script|style|noscript)[^>]*>.*?</\1>", " ", body, flags=re.S | re.I)
+    official = ""
+    if "contestgirl.com" in url:
+        txt = clean(nos); i = txt.find(" Prize:")
+        txt = txt[i if i > 0 else 0:]; txt = txt.split("Comments:")[0]
+        # contestgirl's outbound redirect (/sweepstakes/) is robots-disallowed; keep detail page
+    else:
+        i = nos.find("entry-content")
+        seg = nos[i:i + 60000] if i > 0 else nos
+        txt = clean(seg)[:8000]
+        for m in re.finditer(r'<a[^>]+href="(https?://[^"]+)"[^>]*>(.*?)</a>', seg, re.S):
+            label = clean(m.group(2))
+            if re.search(r"click here to enter|enter now|enter here|official (entry|site)", label, re.I) and not re.search(AGG_RX, m.group(1)):
+                official = html.unescape(m.group(1)); break
+    return txt, official
+
+def parse_detail(url, body):
+    txt, official = article_text(url, body)
+    end = parse_end(txt)
+    if not end:
+        m = re.search(rf"End(?:s| Date)?:?\s*(({MONTHS})\.?\s+\d{{1,2}},?\s+\d{{4}})", txt)
+        if m: end = parse_end("ends " + m.group(1))
+    fm = re.search(r"(?:Entry Frequency|Entry Limit|Frequency):\s*([A-Za-z ]{3,30})", txt)
+    fword = (fm.group(1) if fm else "").lower()
+    fr = "daily" if re.search(r"daily|unlimited|per day", fword) else ("once" if fword else freq(txt))
+    em = re.search(r"(Eligib\w*|Restrictions):\s*(.{0,700}?)(?:Start Date|End Date|Sponsor|Entry |Value:|Frequency|Prize|$)", txt)
+    elig = em.group(2) if em else ""
+    why = None
+    if end and end < TODAY: why = "expired"
+    else: why = reject_reason("", elig + " " + txt[:3000])
+    return dict(end_date=end.isoformat() if end else "", frequency=fr, official=official, eligibility=elig[:300], reject=why or "")
+
+_cache = None
+def detail(url, budget):
+    """Cached detail lookup. budget is a one-item list counting remaining fetches."""
+    global _cache
+    if _cache is None:
+        _cache = json.load(open(CACHE_PATH)) if os.path.exists(CACHE_PATH) else {}
+    if url in _cache: return _cache[url]
+    if budget[0] <= 0 or not re.search(AGG_RX, url): return None
+    budget[0] -= 1
+    try:
+        if not allowed(url): res = dict(error="robots")
+        else: res = parse_detail(url, fetch(url))
+    except Exception as e:
+        res = dict(error=f"{type(e).__name__}")
+    time.sleep(1)
+    res["checked"] = TODAY.isoformat(); _cache[url] = res
+    return res
+
 def load_rows():
     if not os.path.exists(CSV_PATH): return []
     with open(CSV_PATH, newline="", encoding="utf-8") as f:
@@ -219,19 +274,41 @@ def main():
         except urllib.error.HTTPError as e: status[name] = f"FAILED (HTTP {e.code})"
         except Exception as e: status[name] = f"FAILED ({type(e).__name__}: {str(e)[:60]})"
         time.sleep(1)
+    global _cache
+    _cache = json.load(open(CACHE_PATH)) if os.path.exists(CACHE_PATH) else {}
+    budget = [DETAIL_CAP]
     new, rejected = [], {}
     for c in cands:
         nu, nt = norm_url(c["link"]), norm_title(c["title"])
-        if nu in seen_urls or nt in seen_titles: continue
+        if nu in seen_urls or nt in seen_titles or c["link"] in (_cache or {}): continue
         seen_urls.add(nu); seen_titles.add(nt)
         end = parse_end(c["text"])
         if end and end < TODAY: rejected["expired"] = rejected.get("expired", 0) + 1; continue
         why = reject_reason(c["title"], c["text"])
         if why: rejected[why] = rejected.get(why, 0) + 1; continue
+        d = detail(c["link"], budget)
+        if d and not d.get("error"):
+            if d["reject"]: rejected["detail:" + d["reject"]] = rejected.get("detail:" + d["reject"], 0) + 1; continue
+            if d["end_date"]: end = date.fromisoformat(d["end_date"])
+            c["dfreq"] = d["frequency"]
+            if d["official"]: c["agg"] = c["link"]; c["link"] = d["official"]
         val = parse_value(c["title"] + " " + c["text"][:3000])
-        c.update(end=end.isoformat() if end else "", value=val, freq=freq(c["text"]), score=score(c["title"], c["text"][:3000], val))
+        c.update(end=end.isoformat() if end else "", value=val, freq=c.get("dfreq") or freq(c["text"]), score=score(c["title"], c["text"][:3000], val))
         new.append(c)
     new.sort(key=lambda c: -c["score"])
+    # re-validate existing rows missing an end date (capped; continues on later runs)
+    reval = {"checked": 0, "excluded": {}, "dated": 0}
+    for r in rows:
+        if r["end_date"] or r["tag"] == "Excluded" or not re.search(AGG_RX, r["entry_link"]): continue
+        if r["entry_link"] in (_cache or {}) or budget[0] <= 0: continue
+        d = detail(r["entry_link"], budget)
+        if not d or d.get("error"): continue
+        reval["checked"] += 1
+        if d["end_date"]: r["end_date"] = d["end_date"]; reval["dated"] += 1
+        if d["frequency"]: r["frequency"] = d["frequency"]
+        if d["reject"]:
+            r["tag"] = "Excluded"; reval["excluded"][d["reject"]] = reval["excluded"].get(d["reject"], 0) + 1
+        elif d["official"]: r["entry_link"] = d["official"]
     stamp = TODAY.isoformat()
     for c in new:
         rows.append(dict(prize=c["title"], est_value=c["value"] or "", entry_link=c["link"], end_date=c["end"],
@@ -241,11 +318,12 @@ def main():
     with open(tmp, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=COLS); w.writeheader(); w.writerows(rows)
     os.replace(tmp, CSV_PATH)
+    if _cache is not None: json.dump(_cache, open(CACHE_PATH, "w"), indent=0)
     write_html(rows)
-    json.dump({"date": stamp, "sources": status, "new": len(new), "rejected": rejected}, open(STATUS_PATH, "w"), indent=1)
+    json.dump({"date": stamp, "sources": status, "new": len(new), "rejected": rejected, "revalidated": reval, "detail_fetches": DETAIL_CAP - budget[0]}, open(STATUS_PATH, "w"), indent=1)
     if VERBOSE:
         for k, v in status.items(): print(f"# {k}: {v}", file=sys.stderr)
-        print(f"# new={len(new)} rejected={rejected}", file=sys.stderr)
+        print(f"# new={len(new)} rejected={rejected} reval={reval} fetches={DETAIL_CAP - budget[0]}", file=sys.stderr)
     if not new: print("NOTHING_NEW"); return
     for i, c in enumerate(new[:10], 1):
         v = f"${c['value']:,}" if c["value"] else "?"
@@ -275,7 +353,7 @@ button,select,input{font-size:15px;padding:8px;border-radius:8px;border:1px soli
 <script>const D=""" + js + """;
 function v(x){return parseFloat(x.est_value)||0}
 function r(){const T=new Date().toISOString().slice(0,10),tg=document.getElementById('t').value,sx=document.getElementById('x').checked,s=document.getElementById('s').value,q=document.getElementById('q').value.toLowerCase(),h=document.getElementById('h').checked;
-let a=D.filter(x=>(!q||(x.prize+x.source).toLowerCase().includes(q))&&!(h&&x.entered_date&&x.frequency!='daily')&&(sx||!x.end_date||x.end_date>=T)&&(!tg||x.tag==tg));
+let a=D.filter(x=>(!q||(x.prize+x.source).toLowerCase().includes(q))&&!(h&&x.entered_date&&x.frequency!='daily')&&(sx||!x.end_date||x.end_date>=T)&&(!tg||x.tag==tg)&&x.tag!='Excluded');
 a.sort((x,y)=>s=='value'?v(y)-v(x):s=='end'?((x.end_date||'9999')<(y.end_date||'9999')?-1:1):s=='new'?(y.first_seen.localeCompare(x.first_seen)||v(y)-v(x)):s=='prize'?x.prize.localeCompare(y.prize):y.score-x.score);
 const e=t=>String(t).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 document.getElementById('l').innerHTML=a.map(x=>`<div class="card ${x.entered_date?'done':''}"><a href="${e(x.entry_link)}" target="_blank" rel="noopener">${e(x.prize)}</a><a class="go" href="${e(x.entry_link)}" target="_blank" rel="noopener">Tap to open &amp; enter &rarr;</a>
